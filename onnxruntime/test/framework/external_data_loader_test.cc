@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "test/util/include/asserts.h"
 #include "test/util/include/test_environment.h"
 
 #if !defined(ORT_MINIMAL_BUILD) && !defined(DISABLE_EXTERNAL_INITIALIZERS)
