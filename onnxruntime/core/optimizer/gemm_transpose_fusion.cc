@@ -3,6 +3,8 @@
 
 #include "core/optimizer/gemm_transpose_fusion.h"
 
+#include <algorithm>
+
 #include "core/graph/graph_utils.h"
 #include "core/optimizer/initializer.h"
 #include "core/optimizer/utils.h"
@@ -102,6 +104,24 @@ Status GemmTransposeFusion::Apply(Graph& graph, Node& node, RewriteRuleEffect& m
   new_gemm_node.AddAttribute("beta", gemm_node.GetAttributes().at("beta").f());
 
   new_gemm_node.SetExecutionProviderType(gemm_node.GetExecutionProviderType());
+
+  // FinalizeNodeFusion only moves the input edges of nodes_to_remove[0]. Connect every other input to its producer,
+  // e.g. a Transpose that is kept because it has a non-Gemm consumer. Without the edge, later rewrites such as
+  // EliminateIdentity treat that consumer as the only one and may rename the producer's output.
+  for (int i = 0, end = static_cast<int>(new_gemm_input_defs.size()); i < end; ++i) {
+    const NodeArg* input_def = new_gemm_input_defs[i];
+    if (input_def == nullptr || !input_def->Exists()) {
+      continue;
+    }
+    const Node* producer = graph.GetProducerNode(input_def->Name());
+    if (producer == nullptr ||
+        std::any_of(nodes_to_remove.begin(), nodes_to_remove.end(),
+                    [producer](const Node& n) { return n.Index() == producer->Index(); })) {
+      continue;
+    }
+    int src_idx = graph_utils::GetNodeOutputIndexFromOutputName(*producer, input_def->Name());
+    graph.AddEdge(producer->Index(), new_gemm_node.Index(), src_idx, i);
+  }
 
   graph_utils::FinalizeNodeFusion(graph, nodes_to_remove, new_gemm_node);
 

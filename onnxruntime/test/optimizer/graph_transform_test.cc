@@ -6220,6 +6220,50 @@ TEST_F(GraphTransformationTests, GemmTransposeFusionPreservesIdentityOutputWhenF
   }
 }
 
+// A Transpose kept for a non-Gemm consumer must stay connected to the fused Gemm, so that EliminateIdentity, run in
+// the same pass, does not rename its output while the fused Gemm still reads it.
+TEST_F(GraphTransformationTests, GemmTransposeFusionKeepsEdgeFromRetainedTranspose) {
+  auto build_test_case = [](ModelTestBuilder& builder) {
+    auto* input_a = builder.MakeInput<float>(std::vector<int64_t>{3, 4}, "A");
+    auto* input_b = builder.MakeInput<float>(std::vector<int64_t>{5, 4}, "B");
+    auto* transpose_a_output = builder.MakeIntermediate<float>(std::vector<int64_t>{4, 3});
+    auto* transpose_b_output = builder.MakeIntermediate<float>(std::vector<int64_t>{4, 5});
+    auto* gemm_output = builder.MakeOutput<float>(std::vector<int64_t>{3, 5});
+    auto* identity_output = builder.MakeOutput<float>(std::vector<int64_t>{4, 3});
+
+    builder.AddNode("Transpose", {input_a}, {transpose_a_output});
+    builder.AddNode("Transpose", {input_b}, {transpose_b_output});
+    builder.AddNode("Identity", {transpose_a_output}, {identity_output});
+    auto& gemm = builder.AddNode("Gemm", {transpose_a_output, transpose_b_output}, {gemm_output});
+    gemm.AddAttribute("transA", int64_t{1});
+    gemm.AddAttribute("alpha", 3.0f);
+  };
+
+  auto check_graph = [](Graph& graph) {
+    auto op_count = CountOpsInGraph(graph);
+    TEST_RETURN_IF_NOT(op_count["Transpose"] == 1);
+    TEST_RETURN_IF_NOT(op_count["Gemm"] == 1);
+    TEST_RETURN_IF_NOT(op_count["Identity"] == 1);
+    for (const auto& node : graph.Nodes()) {
+      if (node.OpType() == "Gemm") {
+        TEST_RETURN_IF_NOT(node.GetAttributes().at("transA").i() == 1);
+        TEST_RETURN_IF_NOT(node.GetAttributes().at("transB").i() == 1);
+        TEST_RETURN_IF_NOT(node.InputDefs()[1]->Name() == "B");
+        const Node* input_node = graph_utils::GetInputNode(node, 0);
+        TEST_RETURN_IF_NOT(input_node != nullptr && input_node->OpType() == "Transpose");
+        TEST_RETURN_IF_NOT(input_node->OutputDefs()[0] == node.InputDefs()[0]);
+      }
+    }
+    return Status::OK();
+  };
+
+  auto rule_transformer = std::make_unique<RuleBasedGraphTransformer>("RuleTransformer");
+  ASSERT_STATUS_OK(rule_transformer->Register(std::make_unique<EliminateIdentity>()));
+  ASSERT_STATUS_OK(rule_transformer->Register(std::make_unique<GemmTransposeFusion>()));
+  ASSERT_STATUS_OK(TestGraphTransformer(build_test_case, 17, *logger_, std::move(rule_transformer),
+                                        TransformerLevel::Level1, 2, nullptr, check_graph));
+}
+
 TEST_F(GraphTransformationTests, GemmTransposeFusionPreservesPublicInputTransposeWhenFusingOtherInput) {
   for (bool public_input_a : {false, true}) {
     for (bool initial_trans_a : {false, true}) {
