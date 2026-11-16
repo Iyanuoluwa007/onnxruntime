@@ -1490,7 +1490,9 @@ TEST_F(GraphTransformationTests, ConstantFoldingIfConstantInliningRebuildEdges) 
   ASSERT_EQ(op_to_count["Mul"], 1);
   ASSERT_EQ(op_to_count["ReduceSum"], 1);
   ASSERT_EQ(op_to_count["Sqrt"], 1);
-  ASSERT_EQ(op_to_count["Cast"], 2);
+  // The fp16 ReduceSum runs on an fp32 CPU kernel. Its result is cast back to fp16 before the model's own
+  // Cast(float16 -> float) reads it, so that Cast pair is kept along with the input upcast and the output downcast.
+  ASSERT_EQ(op_to_count["Cast"], 4);
 }
 
 TEST_F(GraphTransformationTests, ConstantFoldingIfConstantInliningEdgesWithMiddleArgNonExisting) {

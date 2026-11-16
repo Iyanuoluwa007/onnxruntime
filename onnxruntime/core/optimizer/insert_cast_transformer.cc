@@ -386,14 +386,17 @@ class RemoveDuplicateCastTransformer : public GraphTransformer {
   }
 
  private:
-  static bool UnsafeCast(DataType src_type, DataType dst_type, const Node& node) {
+  static bool IsInsertedCast(const Node& node) {
+    return node.Name().compare(0, 26, "InsertedPrecisionFreeCast_") == 0;
+  }
+
+  // `precision_free` marks a cast inserted by InsertCastTransformer whose narrowing is not treated as a loss of
+  // precision: the inserted upcasts (f16 -> f32) and downcasts (f32 -> f16) only exist to run fp16 nodes on fp32
+  // CPU kernels.
+  static bool UnsafeCast(DataType src_type, DataType dst_type, bool precision_free) {
     // This is not a complete cast optimisation pass, and is more conservative than it could be.
     // For instance, certain integral -> floating point casts could be optimized but
     // this is left to an explicit cast optimisation pass.
-
-    // The comparison with "InsertedPrecisionFreeCast_" reflects cast nodes that are inserted by InsertCastTransformer.
-    // Such casts should not be considered as loss of precision - the inserted upcasts (f16 -> f32) and
-    // downcasts (f32 -> f16) are inserted to support kernels when on a CPU EP without F16 support.
     auto src_type_group = GetTypeGroup(src_type);
     auto dst_type_group = GetTypeGroup(dst_type);
     if (Unknown == src_type_group || Unknown == dst_type_group) {
@@ -428,7 +431,7 @@ class RemoveDuplicateCastTransformer : public GraphTransformer {
       return true;
     }
 
-    return src_bit_length > dst_bit_length && (node.Name().compare(0, 26, "InsertedPrecisionFreeCast_"));
+    return src_bit_length > dst_bit_length && !precision_free;
   }
 
   Status ApplyImpl(Graph& graph, bool& modified, int graph_level, const logging::Logger& logger) const override {
@@ -466,7 +469,16 @@ class RemoveDuplicateCastTransformer : public GraphTransformer {
         auto src_type = node.InputDefs()[0]->Type();
         auto dst_type = node.OutputDefs()[0]->Type();
 
-        bool loss_precision_cast = UnsafeCast(src_type, dst_type, node);
+        // An inserted downcast is only precision free when its value goes on to another fp32 kernel. A Cast from the
+        // model reads the rounded fp16 value, so that rounding must be kept.
+        bool feeds_model_cast = false;
+        for (auto it = node.OutputNodesBegin(); it != node.OutputNodesEnd(); ++it) {
+          if (it->OpType() == "Cast" && !IsInsertedCast(*it)) {
+            feeds_model_cast = true;
+            break;
+          }
+        }
+        bool loss_precision_cast = UnsafeCast(src_type, dst_type, IsInsertedCast(node) && !feeds_model_cast);
         size_t num_children = node.GetOutputEdgesCount();
 
         bool inconsistent_casts = false;
@@ -475,7 +487,9 @@ class RemoveDuplicateCastTransformer : public GraphTransformer {
           if (output_node.OpType() == "Cast") {
             auto src_type1 = output_node.InputDefs()[0]->Type();
             auto dst_type1 = output_node.OutputDefs()[0]->Type();
-            if (loss_precision_cast && UnsafeCast(dst_type1, src_type1, output_node)) {
+            // Compare by type only: once the first cast loses precision, a widening cast after it completes a
+            // high -> low -> high round trip even if that cast was inserted, and removing them would skip the rounding.
+            if (loss_precision_cast && UnsafeCast(dst_type1, src_type1, /*precision_free*/ false)) {
               inconsistent_casts = true;
               break;
             }

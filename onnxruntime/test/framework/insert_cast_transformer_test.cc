@@ -4,6 +4,7 @@
 #include "core/framework/allocator.h"
 #include "core/optimizer/insert_cast_transformer.h"
 #include "core/graph/constants.h"
+#include "core/graph/graph_utils.h"
 #include "core/graph/model.h"
 #include "core/graph/node_attr_utils.h"
 #include "gtest/gtest.h"
@@ -211,6 +212,94 @@ TEST(TransformerTest, CastRemovalDoesNotLowerPrecisionTest) {
   EXPECT_EQ(graph.NumberOfNodes(), 2);
 }
 
+// A model's own Cast(float -> float16) followed by the upcast that InsertCastTransformer adds for an fp32 fallback
+// kernel is a lossy round trip, so the explicit Cast must be kept.
+TEST(TransformerTest, ExplicitDowncastBeforeFp16FallbackIsKept) {
+  auto model = std::make_shared<onnxruntime::Model>("test", false, DefaultLoggingManager().DefaultLogger());
+  onnxruntime::Graph& graph = model->MainGraph();
+  TypeProto tensor_float_32;
+  tensor_float_32.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT);
+  TypeProto tensor_float_16;
+  tensor_float_16.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT16);
+  onnxruntime::NodeArg& x_def = graph.GetOrCreateNodeArg("X", &tensor_float_32);
+  onnxruntime::NodeArg& h_def = graph.GetOrCreateNodeArg("H", &tensor_float_16);
+  onnxruntime::NodeArg& w_def = graph.GetOrCreateNodeArg("W", &tensor_float_16);
+  onnxruntime::NodeArg& y_def = graph.GetOrCreateNodeArg("Y", &tensor_float_16);
+
+  NodeAttributes cast_attrs = {
+      {"to", utils::MakeAttribute("to", static_cast<int64_t>(TensorProto_DataType_FLOAT16))}};
+  graph.AddNode("explicit_downcast", "Cast", "F32 to F16 cast", ArgMap{&x_def}, ArgMap{&h_def}, &cast_attrs);
+  Node& mul_node = graph.AddNode("mul", "Mul", "F16 Mul", ArgMap{&h_def, &w_def}, ArgMap{&y_def});
+  graph.SetInputs({&x_def, &w_def});
+  graph.SetOutputs({&y_def});
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  InsertCastTransformer transformer("Test", DefaultCpuExecutionProvider()->GetKernelRegistry().get());
+  bool modified = false;
+  ASSERT_STATUS_OK(transformer.Apply(graph, modified, DefaultLoggingManager().DefaultLogger()));
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  const Node* explicit_cast = nullptr;
+  for (const Node& node : graph.Nodes()) {
+    if (node.Name() == "explicit_downcast") {
+      explicit_cast = &node;
+    }
+  }
+  ASSERT_NE(explicit_cast, nullptr);
+  EXPECT_EQ(explicit_cast->InputDefs()[0]->Name(), "X");
+  EXPECT_EQ(explicit_cast->OutputDefs()[0]->TypeAsProto()->tensor_type().elem_type(), TensorProto_DataType_FLOAT16);
+
+  // The fp32 Mul must read the rounded value, not X directly.
+  EXPECT_NE(mul_node.InputDefs()[0]->Name(), "X");
+  const Node* mul_input_0 = graph_utils::GetInputNode(mul_node, 0);
+  ASSERT_NE(mul_input_0, nullptr);
+  EXPECT_EQ(mul_input_0->OpType(), "Cast");
+  EXPECT_EQ(graph_utils::GetInputNode(*mul_input_0, 0), explicit_cast);
+}
+
+// The fp32 fallback result of an fp16 node must still be rounded to fp16 before a Cast from the model reads it.
+TEST(TransformerTest, Fp16FallbackOutputReadByModelCastIsRounded) {
+  auto model = std::make_shared<onnxruntime::Model>("test", false, DefaultLoggingManager().DefaultLogger());
+  onnxruntime::Graph& graph = model->MainGraph();
+  TypeProto tensor_float_16;
+  tensor_float_16.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT16);
+  TypeProto tensor_float_64;
+  tensor_float_64.mutable_tensor_type()->set_elem_type(TensorProto_DataType_DOUBLE);
+  onnxruntime::NodeArg& a_def = graph.GetOrCreateNodeArg("A", &tensor_float_16);
+  onnxruntime::NodeArg& b_def = graph.GetOrCreateNodeArg("B", &tensor_float_16);
+  onnxruntime::NodeArg& p_def = graph.GetOrCreateNodeArg("P", &tensor_float_16);
+  onnxruntime::NodeArg& y_def = graph.GetOrCreateNodeArg("Y", &tensor_float_64);
+
+  NodeAttributes cast_attrs = {
+      {"to", utils::MakeAttribute("to", static_cast<int64_t>(TensorProto_DataType_DOUBLE))}};
+  Node& mul_node = graph.AddNode("mul", "Mul", "F16 Mul", ArgMap{&a_def, &b_def}, ArgMap{&p_def});
+  // Cast has an fp16 CPU kernel, so partitioning assigns it before InsertCastTransformer runs. Only Mul falls back.
+  graph.AddNode("explicit_upcast", "Cast", "F16 to F64 cast", ArgMap{&p_def}, ArgMap{&y_def}, &cast_attrs)
+      .SetExecutionProviderType(kCpuExecutionProvider);
+  graph.SetInputs({&a_def, &b_def});
+  graph.SetOutputs({&y_def});
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  InsertCastTransformer transformer("Test", DefaultCpuExecutionProvider()->GetKernelRegistry().get());
+  bool modified = false;
+  ASSERT_STATUS_OK(transformer.Apply(graph, modified, DefaultLoggingManager().DefaultLogger()));
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  const Node* explicit_cast = nullptr;
+  for (const Node& node : graph.Nodes()) {
+    if (node.Name() == "explicit_upcast") {
+      explicit_cast = &node;
+    }
+  }
+  ASSERT_NE(explicit_cast, nullptr);
+  EXPECT_EQ(explicit_cast->InputDefs()[0]->TypeAsProto()->tensor_type().elem_type(), TensorProto_DataType_FLOAT16);
+
+  const Node* rounding_cast = graph_utils::GetInputNode(*explicit_cast, 0);
+  ASSERT_NE(rounding_cast, nullptr);
+  EXPECT_EQ(rounding_cast->OpType(), "Cast");
+  EXPECT_EQ(graph_utils::GetInputNode(*rounding_cast, 0), &mul_node);
+}
+
 TEST(TransformerTest, CastRemovalDoesNotRemoveSignednessTest) {
   auto model = std::make_shared<onnxruntime::Model>("test", false, DefaultLoggingManager().DefaultLogger());
   onnxruntime::Graph& graph = model->MainGraph();
@@ -327,7 +416,9 @@ TEST(TransformerTest, InsertCastNodeTwice) {
   ASSERT_TRUE(status.IsOK()) << status;
   std::map<std::string, int> op_to_count = CountOpsInGraph(graph);
   EXPECT_TRUE(modified) << "Transformer should have added some Cast nodes";
-  EXPECT_TRUE(op_to_count["Cast"] == 4) << "Insert 7 and remove 5 Cast nodes.";
+  // The model's int64 -> float16 Cast is kept: folding it into the inserted float16 -> float upcast would skip
+  // the float16 rounding.
+  EXPECT_TRUE(op_to_count["Cast"] == 5) << "Insert 7 and remove 4 Cast nodes.";
 
   // Second insert
   modified = false;
@@ -336,7 +427,7 @@ TEST(TransformerTest, InsertCastNodeTwice) {
   op_to_count = CountOpsInGraph(graph);
   // Same graph without modification; The number of Cast node remains
   EXPECT_TRUE(!modified) << "Transformer should not modify the modified graph again";
-  EXPECT_TRUE(op_to_count["Cast"] == 4) << "Remain the same number of Cast node";
+  EXPECT_TRUE(op_to_count["Cast"] == 5) << "Remain the same number of Cast node";
 }
 
 // Test that a node processing fp16 input with a subgraph does not get forced to fp32,
@@ -824,22 +915,68 @@ TEST(TransformerTest, CastFloatToIntToBoolNotFused) {
       << "Cast(float->int32)->Cast(int32->bool) must not be fused to Cast(float->bool)";
 }
 
-// Verify that Cast(float->float16)->Cast(float16->int32) can still be optimized to Cast(float->int32).
-// The first cast is lossy (float->float16) but the destination is not bool, so removal is allowed.
+// Verify that Cast(double->float)->Cast(float->float16) can still be optimized to Cast(double->float16).
+// The first cast is lossy (double->float) but the destination is not bool, so removal is allowed.
 TEST(TransformerTest, LossyCastChainWithNonBoolDestIsOptimized) {
   auto model = std::make_shared<onnxruntime::Model>("test", false, DefaultLoggingManager().DefaultLogger());
   onnxruntime::Graph& graph = model->MainGraph();
 
-  TypeProto tensor_float32;
-  tensor_float32.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT);
-  TypeProto tensor_float16;
-  tensor_float16.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT16);
-  TypeProto tensor_int32;
-  tensor_int32.mutable_tensor_type()->set_elem_type(TensorProto_DataType_INT32);
+  TypeProto tensor_src;
+  tensor_src.mutable_tensor_type()->set_elem_type(TensorProto_DataType_DOUBLE);
+  TypeProto tensor_mid;
+  tensor_mid.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT);
+  TypeProto tensor_dst;
+  tensor_dst.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT16);
 
-  onnxruntime::NodeArg x_def("X", &tensor_float32);
-  onnxruntime::NodeArg mid_def("mid", &tensor_float16);
-  onnxruntime::NodeArg y_def("Y", &tensor_int32);
+  onnxruntime::NodeArg x_def("X", &tensor_src);
+  onnxruntime::NodeArg mid_def("mid", &tensor_mid);
+  onnxruntime::NodeArg y_def("Y", &tensor_dst);
+
+  NodeAttributes cast1_attrs = {
+      {"to", utils::MakeAttribute("to",
+                                  static_cast<int64_t>(TensorProto_DataType_FLOAT))}};
+  NodeAttributes cast2_attrs = {
+      {"to", utils::MakeAttribute("to",
+                                  static_cast<int64_t>(TensorProto_DataType_FLOAT16))}};
+
+  graph.AddNode("Cast_1", "Cast", "double to float",
+                ArgMap{&x_def}, ArgMap{&mid_def}, &cast1_attrs);
+  graph.AddNode("Cast_2", "Cast", "float to float16",
+                ArgMap{&mid_def}, ArgMap{&y_def}, &cast2_attrs);
+
+  auto status = graph.Resolve();
+  ASSERT_TRUE(status.IsOK()) << status.ErrorMessage();
+
+  InsertCastTransformer transformer("Test", DefaultCpuExecutionProvider()->GetKernelRegistry().get());
+
+  bool modified = false;
+  status = transformer.Apply(graph, modified, DefaultLoggingManager().DefaultLogger());
+  EXPECT_TRUE(status.IsOK()) << status.ErrorMessage();
+  status = graph.Resolve();
+  EXPECT_TRUE(status.IsOK()) << status.ErrorMessage();
+
+  std::map<std::string, int> op_counts = CountOpsInGraph(graph);
+  EXPECT_EQ(op_counts["Cast"], 1)
+      << "Cast(double->float)->Cast(float->float16) should be optimized to Cast(double->float16)";
+}
+
+// Cast(float->float16)->Cast(float16->int32) must keep the float16 rounding. The CPU EP runs the second Cast
+// on a float input through an inserted upcast, and folding the first Cast into that upcast would turn the chain
+// into Cast(float->int32). For example, 2049.7 rounds to 2050 in float16 but truncates to 2049 directly.
+TEST(TransformerTest, LossyFloat16CastBeforeIntegerCastIsKept) {
+  auto model = std::make_shared<onnxruntime::Model>("test", false, DefaultLoggingManager().DefaultLogger());
+  onnxruntime::Graph& graph = model->MainGraph();
+
+  TypeProto tensor_src;
+  tensor_src.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT);
+  TypeProto tensor_mid;
+  tensor_mid.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT16);
+  TypeProto tensor_dst;
+  tensor_dst.mutable_tensor_type()->set_elem_type(TensorProto_DataType_INT32);
+
+  onnxruntime::NodeArg x_def("X", &tensor_src);
+  onnxruntime::NodeArg mid_def("mid", &tensor_mid);
+  onnxruntime::NodeArg y_def("Y", &tensor_dst);
 
   NodeAttributes cast1_attrs = {
       {"to", utils::MakeAttribute("to",
@@ -864,10 +1001,9 @@ TEST(TransformerTest, LossyCastChainWithNonBoolDestIsOptimized) {
   status = graph.Resolve();
   EXPECT_TRUE(status.IsOK()) << status.ErrorMessage();
 
-  // The first Cast should be removed, leaving only Cast(float->int32).
   std::map<std::string, int> op_counts = CountOpsInGraph(graph);
-  EXPECT_EQ(op_counts["Cast"], 1)
-      << "Cast(float->float16)->Cast(float16->int32) should be optimized to Cast(float->int32)";
+  EXPECT_EQ(op_counts["Cast"], 2)
+      << "Cast(float->float16)->Cast(float16->int32) must not be folded to Cast(float->int32)";
 }
 
 // Verify that Cast(float->int64)->Cast(int64->int32) can still be optimized to Cast(float->int32).
