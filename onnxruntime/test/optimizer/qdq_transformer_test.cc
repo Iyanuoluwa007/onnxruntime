@@ -2007,6 +2007,29 @@ TEST(QDQTransformerTests, DoubleQDQ_CoarserFirstScaleIsKept) {
                     1e-5, 1e-5);
 }
 
+// Scales below the 1e-20 equality tolerance must not bypass the coarser-first check.
+TEST(QDQTransformerTests, DoubleQDQ_CoarserFirstTinyScaleIsKept) {
+  auto build_test_case = [](ModelTestBuilder& builder) {
+    auto* input_arg = builder.MakeInput<float>({1, 4}, {0.0f, 1.2e-21f, 1.6e-21f, 1.1e-21f});
+    auto* output_arg = builder.MakeOutput();
+    auto* q1_output = builder.MakeIntermediate();
+    auto* dq1_output = builder.MakeIntermediate();
+    auto* q2_output = builder.MakeIntermediate();
+    builder.AddQuantizeLinearNode<uint8_t>(input_arg, 1e-21f, uint8_t{0}, q1_output);
+    builder.AddDequantizeLinearNode<uint8_t>(q1_output, 1e-21f, uint8_t{0}, dq1_output);
+    builder.AddQuantizeLinearNode<uint8_t>(dq1_output, 1e-22f, uint8_t{0}, q2_output);
+    builder.AddDequantizeLinearNode<uint8_t>(q2_output, 1e-22f, uint8_t{0}, output_arg);
+  };
+
+  auto check_graph = [](InferenceSessionWrapper& session) {
+    auto op_to_count = CountOpsInGraph(session.GetGraph());
+    EXPECT_EQ(op_to_count["QuantizeLinear"], 2);
+    EXPECT_EQ(op_to_count["DequantizeLinear"], 2);
+  };
+
+  TransformerTester(build_test_case, check_graph, TransformerLevel::Default, TransformerLevel::Level1, 13);
+}
+
 // Verifies fix for bug in the IsQDQPairSupported utility function, which is used by
 // various optimizers such as DoubleQDQPairsRemover. The bug causes an exception when
 // IsQDQPairIsSupported() is called with a Q -> DQ sequence that uses different scale types.

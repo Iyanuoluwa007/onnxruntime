@@ -108,17 +108,17 @@ static bool FindNewZeroPointAndScale(const Graph& graph, const Node& node1, cons
   T zero_point_2 = zero_point_init_2.data<T>()[0];
   const float scale_1 = scale_init_1.data<float>()[0];
   const float scale_2 = scale_init_2.data<float>()[0];
-  // No need to rest the value if values are equal
-  if (zero_point_1 == zero_point_2 && abs(scale_1 - scale_2) < 1E-20) {
-    skip_reset = true;
-    return true;
-  }
   // The merged pair quantizes with a step no larger than the finer of the two scales, so the rounding of the
   // coarser pair is lost. That stays within half a step of the final output only when the second pair is the
   // coarser one. If the first pair is coarser, e.g. scale 1 followed by scale 0.1, the result can be off by many
   // output steps, so keep both pairs.
   if (scale_1 > scale_2) {
     return false;
+  }
+  // No need to rest the value if values are equal
+  if (zero_point_1 == zero_point_2 && abs(scale_1 - scale_2) < 1E-20) {
+    skip_reset = true;
+    return true;
   }
   T q_min = std::numeric_limits<T>::min();
   T q_max = std::numeric_limits<T>::max();
