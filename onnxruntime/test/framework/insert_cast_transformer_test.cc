@@ -257,47 +257,50 @@ TEST(TransformerTest, ExplicitDowncastBeforeFp16FallbackIsKept) {
   EXPECT_EQ(graph_utils::GetInputNode(*mul_input_0, 0), explicit_cast);
 }
 
-// The fp32 fallback result of an fp16 node must still be rounded to fp16 before a Cast from the model reads it.
+// The fp32 fallback result of an fp16 node must still be rounded to fp16 before a Cast from the model reads it,
+// including when the Cast targets an integer type that can represent every fp16 integer value exactly.
 TEST(TransformerTest, Fp16FallbackOutputReadByModelCastIsRounded) {
-  auto model = std::make_shared<onnxruntime::Model>("test", false, DefaultLoggingManager().DefaultLogger());
-  onnxruntime::Graph& graph = model->MainGraph();
-  TypeProto tensor_float_16;
-  tensor_float_16.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT16);
-  TypeProto tensor_float_64;
-  tensor_float_64.mutable_tensor_type()->set_elem_type(TensorProto_DataType_DOUBLE);
-  onnxruntime::NodeArg& a_def = graph.GetOrCreateNodeArg("A", &tensor_float_16);
-  onnxruntime::NodeArg& b_def = graph.GetOrCreateNodeArg("B", &tensor_float_16);
-  onnxruntime::NodeArg& p_def = graph.GetOrCreateNodeArg("P", &tensor_float_16);
-  onnxruntime::NodeArg& y_def = graph.GetOrCreateNodeArg("Y", &tensor_float_64);
+  for (const auto target_type : {TensorProto_DataType_DOUBLE, TensorProto_DataType_INT8, TensorProto_DataType_UINT8}) {
+    SCOPED_TRACE(target_type);
+    auto model = std::make_shared<onnxruntime::Model>("test", false, DefaultLoggingManager().DefaultLogger());
+    onnxruntime::Graph& graph = model->MainGraph();
+    TypeProto tensor_float_16;
+    tensor_float_16.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT16);
+    TypeProto tensor_target;
+    tensor_target.mutable_tensor_type()->set_elem_type(target_type);
+    onnxruntime::NodeArg& a_def = graph.GetOrCreateNodeArg("A", &tensor_float_16);
+    onnxruntime::NodeArg& b_def = graph.GetOrCreateNodeArg("B", &tensor_float_16);
+    onnxruntime::NodeArg& p_def = graph.GetOrCreateNodeArg("P", &tensor_float_16);
+    onnxruntime::NodeArg& y_def = graph.GetOrCreateNodeArg("Y", &tensor_target);
 
-  NodeAttributes cast_attrs = {
-      {"to", utils::MakeAttribute("to", static_cast<int64_t>(TensorProto_DataType_DOUBLE))}};
-  Node& mul_node = graph.AddNode("mul", "Mul", "F16 Mul", ArgMap{&a_def, &b_def}, ArgMap{&p_def});
-  // Cast has an fp16 CPU kernel, so partitioning assigns it before InsertCastTransformer runs. Only Mul falls back.
-  graph.AddNode("explicit_upcast", "Cast", "F16 to F64 cast", ArgMap{&p_def}, ArgMap{&y_def}, &cast_attrs)
-      .SetExecutionProviderType(kCpuExecutionProvider);
-  graph.SetInputs({&a_def, &b_def});
-  graph.SetOutputs({&y_def});
-  ASSERT_STATUS_OK(graph.Resolve());
+    NodeAttributes cast_attrs = {{"to", utils::MakeAttribute("to", static_cast<int64_t>(target_type))}};
+    Node& mul_node = graph.AddNode("mul", "Mul", "F16 Mul", ArgMap{&a_def, &b_def}, ArgMap{&p_def});
+    // Cast has an fp16 CPU kernel, so partitioning assigns it before InsertCastTransformer runs. Only Mul falls back.
+    graph.AddNode("explicit_cast", "Cast", "F16 to target cast", ArgMap{&p_def}, ArgMap{&y_def}, &cast_attrs)
+        .SetExecutionProviderType(kCpuExecutionProvider);
+    graph.SetInputs({&a_def, &b_def});
+    graph.SetOutputs({&y_def});
+    ASSERT_STATUS_OK(graph.Resolve());
 
-  InsertCastTransformer transformer("Test", DefaultCpuExecutionProvider()->GetKernelRegistry().get());
-  bool modified = false;
-  ASSERT_STATUS_OK(transformer.Apply(graph, modified, DefaultLoggingManager().DefaultLogger()));
-  ASSERT_STATUS_OK(graph.Resolve());
+    InsertCastTransformer transformer("Test", DefaultCpuExecutionProvider()->GetKernelRegistry().get());
+    bool modified = false;
+    ASSERT_STATUS_OK(transformer.Apply(graph, modified, DefaultLoggingManager().DefaultLogger()));
+    ASSERT_STATUS_OK(graph.Resolve());
 
-  const Node* explicit_cast = nullptr;
-  for (const Node& node : graph.Nodes()) {
-    if (node.Name() == "explicit_upcast") {
-      explicit_cast = &node;
+    const Node* explicit_cast = nullptr;
+    for (const Node& node : graph.Nodes()) {
+      if (node.Name() == "explicit_cast") {
+        explicit_cast = &node;
+      }
     }
-  }
-  ASSERT_NE(explicit_cast, nullptr);
-  EXPECT_EQ(explicit_cast->InputDefs()[0]->TypeAsProto()->tensor_type().elem_type(), TensorProto_DataType_FLOAT16);
+    ASSERT_NE(explicit_cast, nullptr);
+    EXPECT_EQ(explicit_cast->InputDefs()[0]->TypeAsProto()->tensor_type().elem_type(), TensorProto_DataType_FLOAT16);
 
-  const Node* rounding_cast = graph_utils::GetInputNode(*explicit_cast, 0);
-  ASSERT_NE(rounding_cast, nullptr);
-  EXPECT_EQ(rounding_cast->OpType(), "Cast");
-  EXPECT_EQ(graph_utils::GetInputNode(*rounding_cast, 0), &mul_node);
+    const Node* rounding_cast = graph_utils::GetInputNode(*explicit_cast, 0);
+    ASSERT_NE(rounding_cast, nullptr);
+    EXPECT_EQ(rounding_cast->OpType(), "Cast");
+    EXPECT_EQ(graph_utils::GetInputNode(*rounding_cast, 0), &mul_node);
+  }
 }
 
 TEST(TransformerTest, CastRemovalDoesNotRemoveSignednessTest) {

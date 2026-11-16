@@ -479,6 +479,11 @@ class RemoveDuplicateCastTransformer : public GraphTransformer {
           }
         }
         bool loss_precision_cast = UnsafeCast(src_type, dst_type, IsInsertedCast(node) && !feeds_model_cast);
+        // The reverse check below would treat a model Cast to an integer type as safe and fold the downcast into it,
+        // but the integer conversion must still see the fp16 rounded value.
+        if (loss_precision_cast && feeds_model_cast && IsInsertedCast(node)) {
+          continue;
+        }
         size_t num_children = node.GetOutputEdgesCount();
 
         bool inconsistent_casts = false;
