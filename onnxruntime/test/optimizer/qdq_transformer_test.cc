@@ -1972,6 +1972,39 @@ TEST(QDQTransformerTests, DoubleQDQ) {
                    bad_float_point, good_float_point_2);
   test_case_all_u8(false, good_u8_1, good_u8_1, good_u8_2, good_u8_2, good_float_point_1, good_float_point_1,
                    bad_float_point, good_float_point_2, true);  // Use com.microsoft QDQ ops
+
+  // first pair has a coarser scale than the second, so merging would drop its rounding
+  test_case_all_u8(false, good_u8_1, good_u8_1, good_u8_2, good_u8_2, good_float_point_2, good_float_point_2,
+                   good_float_point_1, good_float_point_1);
+  test_case_all_u8(false, good_u8_1, good_u8_1, good_u8_2, good_u8_2, good_float_point_2, good_float_point_2,
+                   good_float_point_1, good_float_point_1, true);  // Use com.microsoft QDQ ops
+  test_case_all_s8(false, good_s8_1, good_s8_1, good_s8_2, good_s8_2, good_float_point_2, good_float_point_2,
+                   good_float_point_1, good_float_point_1);
+}
+
+// Q(scale 1) -> DQ -> Q(scale 0.1) -> DQ rounds to whole numbers first. Merging the pairs into a single
+// scale-0.1 pair dropped that rounding (#32915), so the sequence must be kept and the output must match.
+TEST(QDQTransformerTests, DoubleQDQ_CoarserFirstScaleIsKept) {
+  auto build_test_case = [](ModelTestBuilder& builder) {
+    auto* input_arg = builder.MakeInput<float>({1, 4}, {0.0f, 1.2f, 1.6f, 1.1f});
+    auto* output_arg = builder.MakeOutput();
+    auto* q1_output = builder.MakeIntermediate();
+    auto* dq1_output = builder.MakeIntermediate();
+    auto* q2_output = builder.MakeIntermediate();
+    builder.AddQuantizeLinearNode<uint8_t>(input_arg, 1.0f, uint8_t{128}, q1_output);
+    builder.AddDequantizeLinearNode<uint8_t>(q1_output, 1.0f, uint8_t{128}, dq1_output);
+    builder.AddQuantizeLinearNode<uint8_t>(dq1_output, 0.1f, uint8_t{0}, q2_output);
+    builder.AddDequantizeLinearNode<uint8_t>(q2_output, 0.1f, uint8_t{0}, output_arg);
+  };
+
+  auto check_graph = [](InferenceSessionWrapper& session) {
+    auto op_to_count = CountOpsInGraph(session.GetGraph());
+    EXPECT_EQ(op_to_count["QuantizeLinear"], 2);
+    EXPECT_EQ(op_to_count["DequantizeLinear"], 2);
+  };
+
+  TransformerTester(build_test_case, check_graph, TransformerLevel::Default, TransformerLevel::Level1, 13,
+                    1e-5, 1e-5);
 }
 
 // Verifies fix for bug in the IsQDQPairSupported utility function, which is used by

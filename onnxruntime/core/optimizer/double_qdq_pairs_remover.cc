@@ -113,6 +113,13 @@ static bool FindNewZeroPointAndScale(const Graph& graph, const Node& node1, cons
     skip_reset = true;
     return true;
   }
+  // The merged pair quantizes with a step no larger than the finer of the two scales, so the rounding of the
+  // coarser pair is lost. That stays within half a step of the final output only when the second pair is the
+  // coarser one. If the first pair is coarser, e.g. scale 1 followed by scale 0.1, the result can be off by many
+  // output steps, so keep both pairs.
+  if (scale_1 > scale_2) {
+    return false;
+  }
   T q_min = std::numeric_limits<T>::min();
   T q_max = std::numeric_limits<T>::max();
 
