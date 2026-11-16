@@ -303,6 +303,52 @@ TEST(TransformerTest, Fp16FallbackOutputReadByModelCastIsRounded) {
   }
 }
 
+// When the fallback result also feeds another fp16 fallback node, only the model Cast needs the rounded value. The
+// inserted downcast and upcast on the fallback branch are still bypassed.
+TEST(TransformerTest, Fp16FallbackOutputRoundedOnlyForModelCast) {
+  auto model = std::make_shared<onnxruntime::Model>("test", false, DefaultLoggingManager().DefaultLogger());
+  onnxruntime::Graph& graph = model->MainGraph();
+  TypeProto tensor_float_16;
+  tensor_float_16.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT16);
+  TypeProto tensor_float_64;
+  tensor_float_64.mutable_tensor_type()->set_elem_type(TensorProto_DataType_DOUBLE);
+  onnxruntime::NodeArg& a_def = graph.GetOrCreateNodeArg("A", &tensor_float_16);
+  onnxruntime::NodeArg& b_def = graph.GetOrCreateNodeArg("B", &tensor_float_16);
+  onnxruntime::NodeArg& p_def = graph.GetOrCreateNodeArg("P", &tensor_float_16);
+  onnxruntime::NodeArg& q_def = graph.GetOrCreateNodeArg("Q", &tensor_float_16);
+  onnxruntime::NodeArg& y_def = graph.GetOrCreateNodeArg("Y", &tensor_float_64);
+
+  NodeAttributes cast_attrs = {
+      {"to", utils::MakeAttribute("to", static_cast<int64_t>(TensorProto_DataType_DOUBLE))}};
+  Node& mul_node = graph.AddNode("mul", "Mul", "F16 Mul", ArgMap{&a_def, &b_def}, ArgMap{&p_def});
+  Node& mul2_node = graph.AddNode("mul2", "Mul", "F16 Mul", ArgMap{&p_def, &b_def}, ArgMap{&q_def});
+  graph.AddNode("explicit_upcast", "Cast", "F16 to F64 cast", ArgMap{&p_def}, ArgMap{&y_def}, &cast_attrs)
+      .SetExecutionProviderType(kCpuExecutionProvider);
+  graph.SetInputs({&a_def, &b_def});
+  graph.SetOutputs({&y_def, &q_def});
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  InsertCastTransformer transformer("Test", DefaultCpuExecutionProvider()->GetKernelRegistry().get());
+  bool modified = false;
+  ASSERT_STATUS_OK(transformer.Apply(graph, modified, DefaultLoggingManager().DefaultLogger()));
+  ASSERT_STATUS_OK(graph.Resolve());
+
+  const Node* explicit_cast = nullptr;
+  for (const Node& node : graph.Nodes()) {
+    if (node.Name() == "explicit_upcast") {
+      explicit_cast = &node;
+    }
+  }
+  ASSERT_NE(explicit_cast, nullptr);
+  const Node* rounding_cast = graph_utils::GetInputNode(*explicit_cast, 0);
+  ASSERT_NE(rounding_cast, nullptr);
+  EXPECT_EQ(rounding_cast->OpType(), "Cast");
+  EXPECT_EQ(graph_utils::GetInputNode(*rounding_cast, 0), &mul_node);
+
+  // The second fp32 Mul reads the first one's fp32 output directly.
+  EXPECT_EQ(graph_utils::GetInputNode(mul2_node, 0), &mul_node);
+}
+
 TEST(TransformerTest, CastRemovalDoesNotRemoveSignednessTest) {
   auto model = std::make_shared<onnxruntime::Model>("test", false, DefaultLoggingManager().DefaultLogger());
   onnxruntime::Graph& graph = model->MainGraph();

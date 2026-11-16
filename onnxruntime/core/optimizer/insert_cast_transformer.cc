@@ -470,26 +470,19 @@ class RemoveDuplicateCastTransformer : public GraphTransformer {
         auto dst_type = node.OutputDefs()[0]->Type();
 
         // An inserted downcast is only precision free when its value goes on to another fp32 kernel. A Cast from the
-        // model reads the rounded fp16 value, so that rounding must be kept.
-        bool feeds_model_cast = false;
-        for (auto it = node.OutputNodesBegin(); it != node.OutputNodesEnd(); ++it) {
-          if (it->OpType() == "Cast" && !IsInsertedCast(*it)) {
-            feeds_model_cast = true;
-            break;
-          }
-        }
-        bool loss_precision_cast = UnsafeCast(src_type, dst_type, IsInsertedCast(node) && !feeds_model_cast);
-        // The reverse check below would treat a model Cast to an integer type as safe and fold the downcast into it,
-        // but the integer conversion must still see the fp16 rounded value.
-        if (loss_precision_cast && feeds_model_cast && IsInsertedCast(node)) {
-          continue;
-        }
+        // model reads the rounded fp16 value, so such a Cast is left out of the rewrite below. That also keeps this
+        // node, while inserted upcasts on other branches can still be bypassed.
+        const bool inserted_lossy_cast = IsInsertedCast(node) && UnsafeCast(src_type, dst_type, false);
+        bool loss_precision_cast = UnsafeCast(src_type, dst_type, IsInsertedCast(node));
         size_t num_children = node.GetOutputEdgesCount();
 
         bool inconsistent_casts = false;
         for (auto it = node.OutputNodesBegin(); it != node.OutputNodesEnd(); ++it) {
           const Node& output_node(*it);
           if (output_node.OpType() == "Cast") {
+            if (inserted_lossy_cast && !IsInsertedCast(output_node)) {
+              continue;
+            }
             auto src_type1 = output_node.InputDefs()[0]->Type();
             auto dst_type1 = output_node.OutputDefs()[0]->Type();
             // Compare by type only: once the first cast loses precision, a widening cast after it completes a
